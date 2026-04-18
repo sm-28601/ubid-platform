@@ -1,68 +1,75 @@
 """
 Entity Resolution Orchestrator for UBID Platform.
-
-Coordinates the full resolution pipeline:
-1. Load source records from DB
-2. Normalize all text fields
-3. Apply blocking to create candidate pairs
-4. Score each candidate pair
-5. Classify into auto-link / review / separate
-6. Cluster auto-linked records
-7. Generate UBIDs for resolved clusters
-8. Store review-needed pairs for human workflow
+Implements Incremental Ingestion to preserve reviewer locks.
 """
 
 import json
 from datetime import datetime
 from collections import defaultdict
-from database.schema import get_connection
+from database.schema import get_session
+from database.models import SourceRecord, UbidMaster, UbidLinkage, MatchCandidate, AuditLog
 from engine.normalizer import normalize_business_name, normalize_address
 from engine.blocker import build_blocks, generate_candidate_pairs, get_block_stats
 from engine.matcher import compute_similarity, THRESHOLD_AUTO_LINK, THRESHOLD_REVIEW
 from engine.ubid_manager import generate_ubid, create_ubid_record, link_record_to_ubid, choose_canonical
 
 
-def load_source_records():
-    """Load all source records from DB."""
-    conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM source_records ORDER BY id")
-    records = [dict(row) for row in cursor.fetchall()]
-    conn.close()
+def load_source_records(session):
+    records_orm = session.query(SourceRecord).order_by(SourceRecord.id).all()
+    records = []
+    for r in records_orm:
+        records.append({
+            "id": r.id,
+            "source_system": r.source_system,
+            "source_id": r.source_id,
+            "raw_name": r.raw_name,
+            "raw_address": r.raw_address,
+            "normalized_name": r.normalized_name,
+            "normalized_address": r.normalized_address,
+            "pincode": r.pincode,
+            "pan": r.pan,
+            "gstin": r.gstin,
+            "owner_name": r.owner_name,
+            "registration_date": r.registration_date,
+            "category": r.category
+        })
     return records
 
 
-def normalize_records(records):
-    """Normalize name and address fields for all records."""
-    conn = get_connection()
-    cursor = conn.cursor()
+def get_unresolved_ids(session):
+    linked_subs = session.query(SourceRecord.id).join(
+        UbidLinkage,
+        (SourceRecord.source_system == UbidLinkage.source_system) &
+        (SourceRecord.source_id == UbidLinkage.source_id)
+    ).filter(UbidLinkage.is_active == True).all()
+    return set([r[0] for r in linked_subs])
 
+
+def get_linked_ubid(session, source_system, source_id):
+    link = session.query(UbidLinkage).filter_by(
+        source_system=source_system, source_id=source_id, is_active=True
+    ).first()
+    return link.ubid if link else None
+
+
+def normalize_records(session, records):
     for rec in records:
         rec["normalized_name"] = normalize_business_name(rec["raw_name"])
         rec["normalized_address"] = normalize_address(rec["raw_address"])
+        
+        orm_rec = session.query(SourceRecord).get(rec["id"])
+        orm_rec.normalized_name = rec["normalized_name"]
+        orm_rec.normalized_address = rec["normalized_address"]
 
-        # Update DB
-        cursor.execute("""
-            UPDATE source_records
-            SET normalized_name = ?, normalized_address = ?
-            WHERE id = ?
-        """, (rec["normalized_name"], rec["normalized_address"], rec["id"]))
-
-    conn.commit()
-    conn.close()
+    session.commit()
     return records
 
 
 def build_record_index(records):
-    """Build a dict from record id to record for quick lookup."""
     return {rec["id"]: rec for rec in records}
 
 
 def cluster_auto_links(auto_links):
-    """
-    Build connected components from auto-linked pairs using Union-Find.
-    Returns list of clusters (sets of record ids).
-    """
     parent = {}
 
     def find(x):
@@ -81,213 +88,208 @@ def cluster_auto_links(auto_links):
         parent.setdefault(id_b, id_b)
         union(id_a, id_b)
 
-    # Group by root
     clusters = defaultdict(set)
     for node in parent:
         clusters[find(node)].add(node)
 
-    # Also add singletons (records that didn't match anything)
     return list(clusters.values())
 
 
 def run_resolution():
-    """
-    Execute the full entity resolution pipeline.
-    Returns a summary of results.
-    """
-    print("[RESOLVE] Starting entity resolution pipeline...")
+    print("[RESOLVE] Starting incremental entity resolution pipeline...")
     start_time = datetime.now()
 
-    # Step 1: Load records
-    records = load_source_records()
-    print(f"[RESOLVE] Loaded {len(records)} source records")
+    session = get_session()
+    try:
+        records = load_source_records(session)
+        print(f"[RESOLVE] Loaded {len(records)} total source records")
+        
+        resolved_ids = get_unresolved_ids(session)
+        all_ids = set([r["id"] for r in records])
+        unresolved_ids = all_ids - resolved_ids
+        print(f"[RESOLVE] Found {len(unresolved_ids)} unresolved records waiting for ingestion.")
+        
+        if not unresolved_ids:
+            return {"status": "No new records to resolve."}
 
-    # Step 2: Normalize
-    records = normalize_records(records)
-    print(f"[RESOLVE] Normalized all records")
+        records = normalize_records(session, records)
+        print(f"[RESOLVE] Normalized all records")
 
-    # Step 3: Blocking
-    blocks = build_blocks(records)
-    block_stats = get_block_stats(blocks)
-    print(f"[RESOLVE] Created {block_stats['total_blocks']} blocks")
-    print(f"[RESOLVE] Block types: {block_stats['blocks_by_type']}")
+        blocks = build_blocks(records)
+        block_stats = get_block_stats(blocks)
 
-    # Step 4: Generate candidate pairs
-    candidate_pairs = generate_candidate_pairs(blocks)
-    print(f"[RESOLVE] Generated {len(candidate_pairs)} candidate pairs")
+        candidate_pairs = generate_candidate_pairs(blocks)
+        print(f"[RESOLVE] Generated {len(candidate_pairs)} candidate pairs")
 
-    # Step 5: Score all pairs
-    record_index = build_record_index(records)
+        record_index = build_record_index(records)
 
-    auto_links = []  # (pair, evidence)
-    review_pairs = []  # (pair, score, evidence)
-    separate_pairs = []
+        auto_links = []  
+        direct_attachments = [] 
+        review_pairs = []
+        separate_pairs = []
 
-    conn = get_connection()
-    cursor = conn.cursor()
+        session.query(MatchCandidate).filter(MatchCandidate.status == 'pending').delete()
 
-    # Clear old match candidates
-    cursor.execute("DELETE FROM match_candidates")
-    cursor.execute("DELETE FROM ubid_master")
-    cursor.execute("DELETE FROM ubid_linkages")
+        for (id_a, id_b), shared_blocks in candidate_pairs.items():
+            if id_a not in unresolved_ids and id_b not in unresolved_ids:
+                continue
 
-    for (id_a, id_b), shared_blocks in candidate_pairs.items():
-        rec_a = record_index.get(id_a)
-        rec_b = record_index.get(id_b)
+            rec_a = record_index.get(id_a)
+            rec_b = record_index.get(id_b)
 
-        if not rec_a or not rec_b:
-            continue
+            if not rec_a or not rec_b:
+                continue
 
-        # Skip same-record comparison
-        if rec_a["source_system"] == rec_b["source_system"] and rec_a["source_id"] == rec_b["source_id"]:
-            continue
+            if rec_a["source_system"] == rec_b["source_system"] and rec_a["source_id"] == rec_b["source_id"]:
+                continue
 
-        score, evidence, classification = compute_similarity(rec_a, rec_b)
+            score, evidence, classification = compute_similarity(rec_a, rec_b)
+            evidence["shared_blocks"] = list(shared_blocks)
 
-        evidence["shared_blocks"] = list(shared_blocks)
+            if classification == "auto_link":
+                if id_a in unresolved_ids and id_b in unresolved_ids:
+                    auto_links.append(((id_a, id_b), evidence))
+                else:
+                    resolved_id = id_a if id_a not in unresolved_ids else id_b
+                    unresolved_id = id_b if id_a not in unresolved_ids else id_a
+                    direct_attachments.append((unresolved_id, resolved_id, score, evidence))
+            elif classification == "review":
+                review_pairs.append(((id_a, id_b), score, evidence))
+                
+                can = MatchCandidate(
+                    record_a_id=id_a,
+                    record_b_id=id_b,
+                    similarity_score=score,
+                    match_evidence=json.dumps(evidence),
+                    status='pending'
+                )
+                session.add(can)
+            else:
+                separate_pairs.append(((id_a, id_b), score))
 
-        if classification == "auto_link":
-            auto_links.append(((id_a, id_b), evidence))
-        elif classification == "review":
-            review_pairs.append(((id_a, id_b), score, evidence))
+        session.commit()
+        print(f"[RESOLVE] Scored operational pairs: {len(auto_links)} new auto-link pairs, "
+              f"{len(direct_attachments)} direct attachments to existing UBIDs, {len(review_pairs)} reviews")
 
-            # Store in match_candidates for reviewer
-            cursor.execute("""
-                INSERT INTO match_candidates
-                (record_a_id, record_b_id, similarity_score, match_evidence, status)
-                VALUES (?, ?, ?, ?, 'pending')
-            """, (id_a, id_b, score, json.dumps(evidence)))
-        else:
-            separate_pairs.append(((id_a, id_b), score))
+        ubid_attachments = 0
+        for (unresolved_id, resolved_id, score, evidence) in direct_attachments:
+            if unresolved_id not in unresolved_ids:
+                continue
+                
+            rec_unresolved = record_index[unresolved_id]
+            rec_resolved = record_index[resolved_id]
+            
+            ubid = get_linked_ubid(session, rec_resolved["source_system"], rec_resolved["source_id"])
+            if ubid:
+                link_record_to_ubid(
+                    ubid, rec_unresolved["source_system"], rec_unresolved["source_id"],
+                    score, evidence
+                )
+                unresolved_ids.remove(unresolved_id)
+                ubid_attachments += 1
 
-    conn.commit()
-    print(f"[RESOLVE] Scored all pairs: {len(auto_links)} auto-link, "
-          f"{len(review_pairs)} review, {len(separate_pairs)} separate")
+        auto_links_filtered = [pair for pair in auto_links if pair[0][0] in unresolved_ids and pair[0][1] in unresolved_ids]
+        clusters = cluster_auto_links(auto_links_filtered)
+        print(f"[RESOLVE] Formed {len(clusters)} new clusters from auto-links")
 
-    # Step 6: Cluster auto-linked records
-    clusters = cluster_auto_links(auto_links)
-    print(f"[RESOLVE] Formed {len(clusters)} clusters from auto-links")
+        all_clustered_ids = set()
+        for c in clusters:
+            all_clustered_ids.update(c)
 
-    # Also find records not in any cluster (singletons)
-    all_clustered_ids = set()
-    for c in clusters:
-        all_clustered_ids.update(c)
+        singletons = [rid for rid in unresolved_ids if rid not in all_clustered_ids]
+        print(f"[RESOLVE] {len(singletons)} singleton records (no auto-link)")
 
-    singletons = [rec["id"] for rec in records if rec["id"] not in all_clustered_ids]
-    print(f"[RESOLVE] {len(singletons)} singleton records (no auto-link)")
+        ubid_count = 0
 
-    # Step 7: Generate UBIDs
-    ubid_count = 0
+        for cluster in clusters:
+            cluster_records = [record_index[rid] for rid in cluster]
+            
+            best_pan = None
+            best_gstin = None
+            best_pincode = None
 
-    # Process clusters
-    for cluster in clusters:
-        cluster_records = [record_index[rid] for rid in cluster if rid in record_index]
-        if not cluster_records:
-            continue
+            for rec in cluster_records:
+                if rec.get("pan") and not best_pan:
+                    best_pan = rec["pan"]
+                if rec.get("gstin") and not best_gstin:
+                    best_gstin = rec["gstin"]
+                if rec.get("pincode") and not best_pincode:
+                    best_pincode = rec["pincode"]
 
-        # Find best PAN/GSTIN in cluster
-        best_pan = None
-        best_gstin = None
-        best_pincode = None
+            result = generate_ubid(best_pincode, best_pan, best_gstin)
+            if isinstance(result, tuple):
+                ubid, anchor_type, anchor_value = result
+            else:
+                ubid = result
+                anchor_type = anchor_value = None
 
-        for rec in cluster_records:
-            if rec.get("pan") and not best_pan:
-                best_pan = rec["pan"]
-            if rec.get("gstin") and not best_gstin:
-                best_gstin = rec["gstin"]
-            if rec.get("pincode") and not best_pincode:
-                best_pincode = rec["pincode"]
+            canonical_name, canonical_address = choose_canonical(cluster_records)
+            create_ubid_record(ubid, anchor_type, anchor_value, canonical_name, canonical_address, best_pincode)
 
-        # Generate UBID
-        result = generate_ubid(best_pincode, best_pan, best_gstin)
-        if isinstance(result, tuple):
-            ubid, anchor_type, anchor_value = result
-        else:
-            ubid = result
-            anchor_type = anchor_value = None
+            for rec in cluster_records:
+                link_record_to_ubid(
+                    ubid, rec["source_system"], rec["source_id"],
+                    THRESHOLD_AUTO_LINK, {"method": "auto_link", "cluster_size": len(cluster)}
+                )
 
-        # Choose canonical name/address
-        canonical_name, canonical_address = choose_canonical(cluster_records)
+            ubid_count += 1
 
-        # Create UBID record
-        create_ubid_record(ubid, anchor_type, anchor_value,
-                          canonical_name, canonical_address, best_pincode)
+        for rec_id in singletons:
+            rec = record_index.get(rec_id)
+            result = generate_ubid(rec.get("pincode"), rec.get("pan"), rec.get("gstin"))
+            if isinstance(result, tuple):
+                ubid, anchor_type, anchor_value = result
+            else:
+                ubid = result
+                link_record_to_ubid(
+                    ubid, rec["source_system"], rec["source_id"],
+                    1.0, {"method": "pan_anchor_existing"}
+                )
+                continue
 
-        # Link all cluster records to this UBID
-        for rec in cluster_records:
-            # Find matching evidence for this record
-            evidence_for_rec = {"method": "auto_link", "cluster_size": len(cluster)}
-            confidence = THRESHOLD_AUTO_LINK  # minimum for auto-link
-
-            link_record_to_ubid(
-                ubid, rec["source_system"], rec["source_id"],
-                confidence, evidence_for_rec
+            create_ubid_record(
+                ubid, anchor_type, anchor_value,
+                rec.get("raw_name", ""), rec.get("raw_address", ""),
+                rec.get("pincode")
             )
 
-        ubid_count += 1
+            link_record_to_ubid(ubid, rec["source_system"], rec["source_id"], 1.0, {"method": "singleton"})
+            ubid_count += 1
 
-    # Process singletons — each gets its own UBID
-    for rec_id in singletons:
-        rec = record_index.get(rec_id)
-        if not rec:
-            continue
+        elapsed = (datetime.now() - start_time).total_seconds()
 
-        result = generate_ubid(rec.get("pincode"), rec.get("pan"), rec.get("gstin"))
-        if isinstance(result, tuple):
-            ubid, anchor_type, anchor_value = result
-        else:
-            # Already exists (PAN-anchored)
-            ubid = result
-            # Link to existing
-            link_record_to_ubid(
-                ubid, rec["source_system"], rec["source_id"],
-                1.0, {"method": "pan_anchor_existing"}
-            )
-            continue
+        summary = {
+            "total_source_records": len(records),
+            "unresolved_processed": len(unresolved_ids) + ubid_attachments + len(all_clustered_ids),
+            "direct_attachments": ubid_attachments,
+            "new_clusters_formed": len(clusters),
+            "new_singletons": len(singletons),
+            "review_pairs": len(review_pairs),
+            "ubids_created": ubid_count,
+            "elapsed_seconds": round(elapsed, 2),
+        }
 
-        create_ubid_record(
-            ubid, anchor_type, anchor_value,
-            rec.get("raw_name", ""), rec.get("raw_address", ""),
-            rec.get("pincode")
+        audit = AuditLog(
+            action_type="incremental_resolution_complete",
+            details=json.dumps(summary)
         )
+        session.add(audit)
+        session.commit()
 
-        link_record_to_ubid(
-            ubid, rec["source_system"], rec["source_id"],
-            1.0, {"method": "singleton"}
-        )
-        ubid_count += 1
+        print(f"\n[RESOLVE] === Incremental Resolution Complete ===")
+        print(f"[RESOLVE] New UBIDs created: {ubid_count}")
+        print(f"[RESOLVE] Records attached to existing UBIDs: {ubid_attachments}")
+        print(f"[RESOLVE] Pending reviews: {len(review_pairs)}")
+        print(f"[RESOLVE] Time: {elapsed:.2f}s")
+        print(f"[RESOLVE] =======================================\n")
 
-    elapsed = (datetime.now() - start_time).total_seconds()
-
-    summary = {
-        "total_source_records": len(records),
-        "candidate_pairs": len(candidate_pairs),
-        "auto_linked_pairs": len(auto_links),
-        "review_pairs": len(review_pairs),
-        "separate_pairs": len(separate_pairs),
-        "clusters_formed": len(clusters),
-        "singletons": len(singletons),
-        "ubids_created": ubid_count,
-        "elapsed_seconds": round(elapsed, 2),
-        "block_stats": block_stats,
-    }
-
-    # Log audit
-    cursor.execute("""
-        INSERT INTO audit_log (action_type, details)
-        VALUES (?, ?)
-    """, ("resolution_complete", json.dumps(summary)))
-    conn.commit()
-    conn.close()
-
-    print(f"\n[RESOLVE] === Resolution Complete ===")
-    print(f"[RESOLVE] UBIDs created: {ubid_count}")
-    print(f"[RESOLVE] Pending reviews: {len(review_pairs)}")
-    print(f"[RESOLVE] Time: {elapsed:.2f}s")
-    print(f"[RESOLVE] =============================\n")
-
-    return summary
-
+        return summary
+        
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        session.close()
 
 if __name__ == "__main__":
     run_resolution()

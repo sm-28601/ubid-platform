@@ -10,6 +10,7 @@ Handles Indian business name and address normalization:
 """
 
 import re
+from metaphone import doublemetaphone
 
 
 # ── Legal suffixes to strip for comparison ──
@@ -19,6 +20,12 @@ LEGAL_SUFFIXES = [
     r'\bincorporated\b', r'\binc\.?\b', r'\bcorporation\b', r'\bcorp\.?\b',
     r'\b\(regd\.?\)\b', r'\(registered\)', r'\bregd\.?\b',
     r'\b\(unit[\s-]*\d*\)\b', r'\bunit[\s-]*\d+\b',
+]
+
+# ── Domain-specific string block-list ──
+INDIAN_STOPWORDS = [
+    r'\benterprises\b', r'\btraders\b', r'\bindustries\b', r'\bworks\b',
+    r'\bagency\b', r'\bagencies\b', r'\bassociates\b', r'\bco\b', r'\bcompany\b'
 ]
 
 # ── Business abbreviation mappings ──
@@ -107,6 +114,10 @@ def normalize_business_name(raw_name):
 
     # Remove legal suffixes
     for pattern in LEGAL_SUFFIXES:
+        name = re.sub(pattern, '', name, flags=re.IGNORECASE)
+
+    # Remove Indian Stopwords
+    for pattern in INDIAN_STOPWORDS:
         name = re.sub(pattern, '', name, flags=re.IGNORECASE)
 
     # Expand abbreviations
@@ -231,3 +242,14 @@ def soundex(name):
     # Pad or trim to 4 characters
     coded = (coded + '000')[:4]
     return coded
+
+
+def compute_metaphone(name):
+    """
+    Compute Metaphone phonetic encoding.
+    More accurate than soundex for Indian business name transliterations.
+    """
+    if not name:
+        return ""
+    code = doublemetaphone(name)
+    return code[0] if code[0] else ""

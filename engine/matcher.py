@@ -15,15 +15,26 @@ auto-link (≥0.85), review (0.55–0.84), or separate (<0.55).
 """
 
 import json
+import os
 from difflib import SequenceMatcher
+from thefuzz import fuzz
 from engine.normalizer import (
     normalize_pan, normalize_gstin,
-    extract_name_tokens, extract_address_tokens
+    extract_name_tokens, extract_address_tokens, compute_metaphone
 )
 
 # ── Confidence thresholds ──
 THRESHOLD_AUTO_LINK = 0.85
 THRESHOLD_REVIEW = 0.55
+
+RUNTIME_THRESHOLDS_FILE = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "runtime_thresholds.json",
+)
+RUNTIME_WEIGHTS_FILE = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "feature_weights.json",
+)
 
 # ── Signal weights ──
 WEIGHTS = {
@@ -34,6 +45,77 @@ WEIGHTS = {
     "pincode_match": 0.05,
     "owner_similarity": 0.05,
 }
+
+
+def load_runtime_thresholds():
+    """Load calibrated thresholds from disk if available."""
+    defaults = {
+        "auto_link": THRESHOLD_AUTO_LINK,
+        "review_lower": THRESHOLD_REVIEW,
+        "review_upper": THRESHOLD_AUTO_LINK,
+    }
+
+    if not os.path.exists(RUNTIME_THRESHOLDS_FILE):
+        return defaults
+
+    try:
+        with open(RUNTIME_THRESHOLDS_FILE, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+
+        auto_link = float(payload.get("auto_link", defaults["auto_link"]))
+        review_lower = float(payload.get("review_lower", defaults["review_lower"]))
+        review_upper = float(payload.get("review_upper", auto_link))
+
+        # Keep sane ordering even if file was edited manually.
+        review_upper = max(review_lower, review_upper)
+        auto_link = max(auto_link, review_upper)
+
+        return {
+            "auto_link": min(0.99, auto_link),
+            "review_lower": max(0.0, min(0.99, review_lower)),
+            "review_upper": max(0.0, min(0.99, review_upper)),
+        }
+    except (ValueError, OSError, json.JSONDecodeError):
+        return defaults
+
+
+def load_runtime_weights():
+    """Load learned feature weights from disk if available."""
+    if not os.path.exists(RUNTIME_WEIGHTS_FILE):
+        return WEIGHTS
+
+    try:
+        with open(RUNTIME_WEIGHTS_FILE, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+
+        merged = {}
+        for key, default_val in WEIGHTS.items():
+            merged[key] = float(payload.get(key, default_val))
+
+        total = sum(merged.values())
+        if total <= 0:
+            return WEIGHTS
+
+        for key in merged:
+            merged[key] = merged[key] / total
+        return merged
+    except (ValueError, OSError, json.JSONDecodeError):
+        return WEIGHTS
+
+
+def get_calibrated_thresholds():
+    """Public accessor used by APIs and resolver for current thresholds."""
+    return load_runtime_thresholds()
+
+
+def should_auto_link(score):
+    thresholds = get_calibrated_thresholds()
+    return score >= thresholds["auto_link"]
+
+
+def should_send_to_review(score):
+    thresholds = get_calibrated_thresholds()
+    return thresholds["review_lower"] <= score < thresholds["review_upper"]
 
 
 def jaro_winkler(s1, s2):
@@ -101,16 +183,12 @@ def jaro_winkler(s1, s2):
 
 def token_sort_ratio(s1, s2):
     """
-    Compute token-sorted similarity ratio.
-    Sorts tokens alphabetically before comparison, handling word order differences.
+    Compute token-sorted similarity ratio using thefuzz.
     """
     if not s1 or not s2:
         return 0.0
 
-    tokens1 = " ".join(sorted(s1.lower().split()))
-    tokens2 = " ".join(sorted(s2.lower().split()))
-
-    return SequenceMatcher(None, tokens1, tokens2).ratio()
+    return fuzz.token_sort_ratio(s1, s2) / 100.0
 
 
 def token_overlap(tokens1, tokens2):
@@ -143,6 +221,8 @@ def compute_similarity(record_a, record_b):
     """
     evidence = {}
     weighted_score = 0.0
+    thresholds = load_runtime_thresholds()
+    weights = load_runtime_weights()
 
     # ── Signal 1: PAN match ──
     pan_a = normalize_pan(record_a.get("pan"))
@@ -170,7 +250,7 @@ def compute_similarity(record_a, record_b):
             "score": 0.0,
             "note": "One or both records missing PAN"
         }
-    weighted_score += pan_score * WEIGHTS["pan_match"]
+    weighted_score += pan_score * weights["pan_match"]
 
     # ── Signal 2: GSTIN match ──
     gstin_a, _ = normalize_gstin(record_a.get("gstin"))
@@ -189,7 +269,7 @@ def compute_similarity(record_a, record_b):
             "score": 0.0,
             "note": "One or both records missing GSTIN"
         }
-    weighted_score += gstin_score * WEIGHTS["gstin_match"]
+    weighted_score += gstin_score * weights["gstin_match"]
 
     # ── Signal 3: Business name similarity ──
     name_a = record_a.get("normalized_name", "") or ""
@@ -198,19 +278,30 @@ def compute_similarity(record_a, record_b):
     if name_a and name_b:
         jw_score = jaro_winkler(name_a, name_b)
         ts_score = token_sort_ratio(name_a, name_b)
-        # Take the max of Jaro-Winkler and Token Sort — handles different kinds of variation
-        name_score = max(jw_score, ts_score)
+        
+        # Phonetic match
+        meta_a = compute_metaphone(name_a)
+        meta_b = compute_metaphone(name_b)
+        meta_score = 1.0 if meta_a and meta_b and meta_a == meta_b else 0.0
+        if meta_a and meta_b and meta_a != meta_b:
+            # Phonetic distance
+            meta_score = jaro_winkler(meta_a, meta_b)
+            
+        # Take the max or weighted blend of Hybrid signals
+        name_score = max(jw_score, ts_score, meta_score)
+        
         evidence["name_similarity"] = {
             "score": round(name_score, 4),
             "jaro_winkler": round(jw_score, 4),
             "token_sort_ratio": round(ts_score, 4),
+            "metaphone_score": round(meta_score, 4),
             "name_a": name_a,
             "name_b": name_b,
         }
     else:
         name_score = 0.0
         evidence["name_similarity"] = {"score": 0.0, "note": "Missing name"}
-    weighted_score += name_score * WEIGHTS["name_similarity"]
+    weighted_score += name_score * weights["name_similarity"]
 
     # ── Signal 4: Address similarity ──
     addr_a = record_a.get("normalized_address", "") or ""
@@ -228,7 +319,7 @@ def compute_similarity(record_a, record_b):
     else:
         addr_score = 0.0
         evidence["address_similarity"] = {"score": 0.0, "note": "Missing address"}
-    weighted_score += addr_score * WEIGHTS["address_similarity"]
+    weighted_score += addr_score * weights["address_similarity"]
 
     # ── Signal 5: Pincode match ──
     pin_a = (record_a.get("pincode") or "").strip()
@@ -244,7 +335,7 @@ def compute_similarity(record_a, record_b):
     else:
         pin_score = 0.0
         evidence["pincode_match"] = {"score": 0.0, "note": "Missing pincode"}
-    weighted_score += pin_score * WEIGHTS["pincode_match"]
+    weighted_score += pin_score * weights["pincode_match"]
 
     # ── Signal 6: Owner name similarity ──
     owner_a = (record_a.get("owner_name") or "").lower().strip()
@@ -260,14 +351,30 @@ def compute_similarity(record_a, record_b):
     else:
         owner_score = 0.0
         evidence["owner_similarity"] = {"score": 0.0, "note": "Missing owner"}
-    weighted_score += owner_score * WEIGHTS["owner_similarity"]
+    weighted_score += owner_score * weights["owner_similarity"]
 
-    # ── Final classification ──
+    # ── Final classification & Ceilings ──
     weighted_score = round(weighted_score, 4)
 
-    if weighted_score >= THRESHOLD_AUTO_LINK:
+    # Multi-GSTIN ceiling check: Same PAN but conflicting GSTINs should NOT auto-link
+    gstins_differ = (gstin_a and gstin_b and gstin_a != gstin_b)
+    
+    # Requirement: Auto-link must include at least one additional signal (address or owner) > 0.6
+    weak_secondary_signals = (addr_score < 0.6) and (owner_score < 0.6)
+    
+    if weighted_score >= thresholds["auto_link"]:
+        if gstins_differ:
+            # Force human review for ambiguous multi-vertical structures
+            weighted_score = min(weighted_score, 0.84)
+            evidence["ceiling_applied"] = "Different GSTINs on same PAN forces review."
+        elif weak_secondary_signals and pan_score == 1.0:
+            # High score just from PAN+GSTIN+Name but lack of address/owner confirm
+            weighted_score = min(weighted_score, 0.84)
+            evidence["ceiling_applied"] = "Requires address or owner confirmation to auto-link PAN matches."
+
+    if weighted_score >= thresholds["auto_link"]:
         classification = "auto_link"
-    elif weighted_score >= THRESHOLD_REVIEW:
+    elif weighted_score >= thresholds["review_lower"]:
         classification = "review"
     else:
         classification = "separate"

@@ -1,263 +1,259 @@
 """
 UBID Manager — Unique Business Identifier lifecycle management.
-
-Responsibilities:
-- Generate new UBIDs
-- Anchor UBIDs to PAN/GSTIN
-- Link/unlink source records to UBIDs
-- Merge two UBIDs (with full audit trail)
-- Split a UBID (undo a wrong merge)
-- Choose canonical name/address for a UBID
 """
 
 import json
 from datetime import datetime
-from database.schema import get_connection
+from sqlalchemy import func
+from database.schema import get_session
+from database.models import SourceRecord, UbidMaster, UbidLinkage, ActivityEvent, AuditLog
 from engine.normalizer import normalize_pan, normalize_gstin
 
+_global_seq = None
 
-# ── Counters per pincode (maintained in memory, seeded from DB) ──
-_counters = {}
+def _next_sequence(session=None):
+    global _global_seq
+    if _global_seq is None:
+        own_session = session is None
+        if own_session:
+            session = get_session()
+        try:
+            count = session.query(UbidMaster).filter(UbidMaster.anchor_type == None).count()
+            _global_seq = count
+        finally:
+            if own_session:
+                session.close()
+            
+    _global_seq += 1
+    return _global_seq
 
-
-def _next_sequence(pincode):
-    """Get next sequence number for a pincode."""
-    global _counters
-    conn = get_connection()
-    if pincode not in _counters:
-        cursor = conn.cursor()
-        cursor.execute(
-            "SELECT COUNT(*) FROM ubid_master WHERE pincode = ?",
-            (pincode,)
-        )
-        _counters[pincode] = cursor.fetchone()[0]
-    conn.close()
-    _counters[pincode] += 1
-    return _counters[pincode]
-
-
-def generate_ubid(pincode, pan=None, gstin=None):
-    """
-    Generate a new UBID.
-
-    If PAN/GSTIN is available, anchor the UBID to it.
-    Format:
-    - Anchored: UBID-KA-PAN-{PAN_VALUE}
-    - Unanchored: UBID-KA-{PINCODE}-{SEQUENCE}
-    """
-    # Try to derive PAN from GSTIN if not directly available
+def generate_ubid(pincode=None, pan=None, gstin=None, session=None):
     effective_pan = normalize_pan(pan)
     if not effective_pan and gstin:
         _, effective_pan = normalize_gstin(gstin)
 
     if effective_pan:
-        # Check if this PAN already has a UBID
-        conn = get_connection()
-        cursor = conn.cursor()
-        cursor.execute(
-            "SELECT ubid FROM ubid_master WHERE anchor_type = 'PAN' AND anchor_value = ?",
-            (effective_pan,)
-        )
-        row = cursor.fetchone()
-        conn.close()
-        if row:
-            return row["ubid"]  # Return existing UBID
+        own_session = session is None
+        if own_session:
+            session = get_session()
+        try:
+            existing = session.query(UbidMaster).filter_by(
+                anchor_type='PAN', 
+                anchor_value=effective_pan
+            ).first()
+            if existing:
+                return existing.ubid, 'PAN', effective_pan
+        finally:
+            if own_session:
+                session.close()
 
         ubid = f"UBID-KA-PAN-{effective_pan}"
         anchor_type = "PAN"
         anchor_value = effective_pan
     else:
-        seq = _next_sequence(pincode or "000000")
-        ubid = f"UBID-KA-{pincode or '000000'}-{seq:05d}"
+        seq = _next_sequence(session=session)
+        ubid = f"UBID-KA-{seq:07d}"
         anchor_type = None
         anchor_value = None
 
     return ubid, anchor_type, anchor_value
 
-
-def create_ubid_record(ubid, anchor_type, anchor_value, canonical_name,
-                       canonical_address, pincode):
-    """Insert a new UBID into the master table."""
-    conn = get_connection()
-    cursor = conn.cursor()
-
+def create_ubid_record(ubid, anchor_type, anchor_value, canonical_name, canonical_address, pincode, session=None):
+    own_session = session is None
+    if own_session:
+        session = get_session()
     try:
-        cursor.execute("""
-            INSERT INTO ubid_master
-            (ubid, anchor_type, anchor_value, canonical_name, canonical_address, pincode)
-            VALUES (?, ?, ?, ?, ?, ?)
-        """, (ubid, anchor_type, anchor_value, canonical_name, canonical_address, pincode))
-
-        # Audit log
-        cursor.execute("""
-            INSERT INTO audit_log (action_type, ubid, details)
-            VALUES (?, ?, ?)
-        """, ("ubid_created", ubid, json.dumps({
-            "anchor_type": anchor_type,
-            "anchor_value": anchor_value,
-            "canonical_name": canonical_name,
-        })))
-
-        conn.commit()
-    except Exception as e:
-        conn.rollback()
-        # UBID might already exist (race condition) — that's OK
-        if "UNIQUE constraint" in str(e):
-            pass
-        else:
-            raise
+        existing = session.query(UbidMaster).filter_by(ubid=ubid).first()
+        if existing:
+            return ubid 
+            
+        new_ubid = UbidMaster(
+            ubid=ubid,
+            anchor_type=anchor_type,
+            anchor_value=anchor_value,
+            canonical_name=canonical_name,
+            canonical_address=canonical_address,
+            pincode=pincode
+        )
+        session.add(new_ubid)
+        
+        audit = AuditLog(
+            action_type="ubid_created",
+            ubid=ubid,
+            details=json.dumps({
+                "anchor_type": anchor_type,
+                "anchor_value": anchor_value,
+                "canonical_name": canonical_name,
+            })
+        )
+        session.add(audit)
+        if own_session:
+            session.commit()
+    except Exception:
+        if own_session:
+            session.rollback()
+        raise
     finally:
-        conn.close()
-
+        if own_session:
+            session.close()
+        
     return ubid
 
+def link_record_to_ubid(ubid, source_system, source_id, confidence, evidence, linked_by="system", session=None):
+    own_session = session is None
+    if own_session:
+        session = get_session()
+    try:
+        linkage = UbidLinkage(
+            ubid=ubid,
+            source_system=source_system,
+            source_id=source_id,
+            confidence_score=confidence,
+            match_evidence=json.dumps(evidence),
+            linked_by=linked_by
+        )
+        session.add(linkage)
+        
+        audit = AuditLog(
+            action_type="record_linked",
+            ubid=ubid,
+            details=json.dumps({
+                "source_system": source_system,
+                "source_id": source_id,
+                "confidence": confidence,
+                "linked_by": linked_by,
+            })
+        )
+        session.add(audit)
+        if own_session:
+            session.commit()
+    except Exception:
+        if own_session:
+            session.rollback()
+        raise
+    finally:
+        if own_session:
+            session.close()
 
-def link_record_to_ubid(ubid, source_system, source_id, confidence, evidence, linked_by="system"):
-    """Create a linkage between a source record and a UBID."""
-    conn = get_connection()
-    cursor = conn.cursor()
-
-    cursor.execute("""
-        INSERT INTO ubid_linkages
-        (ubid, source_system, source_id, confidence_score, match_evidence, linked_by)
-        VALUES (?, ?, ?, ?, ?, ?)
-    """, (ubid, source_system, source_id, confidence, json.dumps(evidence), linked_by))
-
-    cursor.execute("""
-        INSERT INTO audit_log (action_type, ubid, details)
-        VALUES (?, ?, ?)
-    """, ("record_linked", ubid, json.dumps({
-        "source_system": source_system,
-        "source_id": source_id,
-        "confidence": confidence,
-        "linked_by": linked_by,
-    })))
-
-    conn.commit()
-    conn.close()
-
-
-def merge_ubids(ubid_keep, ubid_remove, merged_by="system", reason=""):
-    """
-    Merge two UBIDs — move all linkages from ubid_remove to ubid_keep.
-    The removed UBID is deactivated, not deleted (for reversibility).
-    """
-    conn = get_connection()
-    cursor = conn.cursor()
-
-    # Move linkages
-    cursor.execute("""
-        UPDATE ubid_linkages SET ubid = ?, linked_by = ?
-        WHERE ubid = ? AND is_active = 1
-    """, (ubid_keep, f"merge:{merged_by}", ubid_remove))
-
-    # Move events
-    cursor.execute("""
-        UPDATE activity_events SET matched_ubid = ?
-        WHERE matched_ubid = ?
-    """, (ubid_keep, ubid_remove))
-
-    # Deactivate old UBID (mark as merged)
-    cursor.execute("""
-        UPDATE ubid_master SET activity_status = 'Merged',
-        updated_at = datetime('now')
-        WHERE ubid = ?
-    """, (ubid_remove,))
-
-    # Audit
-    cursor.execute("""
-        INSERT INTO audit_log (action_type, ubid, details, performed_by)
-        VALUES (?, ?, ?, ?)
-    """, ("ubid_merged", ubid_keep, json.dumps({
-        "merged_ubid": ubid_remove,
-        "reason": reason,
-    }), merged_by))
-
-    conn.commit()
-    conn.close()
-
+def merge_ubids(ubid_keep, ubid_remove, merged_by="system", reason="", session=None):
+    own_session = session is None
+    if own_session:
+        session = get_session()
+    try:
+        linkages = session.query(UbidLinkage).filter_by(ubid=ubid_remove, is_active=True).all()
+        for link in linkages:
+            link.ubid = ubid_keep
+            link.linked_by = f"merge:{merged_by}"
+            
+        events = session.query(ActivityEvent).filter_by(matched_ubid=ubid_remove).all()
+        for evt in events:
+            evt.matched_ubid = ubid_keep
+            
+        old_master = session.query(UbidMaster).filter_by(ubid=ubid_remove).first()
+        if old_master:
+            old_master.activity_status = 'Merged'
+            old_master.updated_at = datetime.utcnow()
+            
+        audit = AuditLog(
+            action_type="ubid_merged",
+            ubid=ubid_keep,
+            performed_by=merged_by,
+            details=json.dumps({
+                "merged_ubid": ubid_remove,
+                "reason": reason,
+            })
+        )
+        session.add(audit)
+        if own_session:
+            session.commit()
+    except Exception:
+        if own_session:
+            session.rollback()
+        raise
+    finally:
+        if own_session:
+            session.close()
 
 def split_ubid(ubid, source_records_to_split, split_by="reviewer", reason=""):
-    """
-    Split records out of a UBID into a new UBID.
-    Used to undo a wrong merge.
-    """
-    conn = get_connection()
-    cursor = conn.cursor()
-
-    # Get first record to split for naming
-    first_rec_id = source_records_to_split[0] if source_records_to_split else None
-    if first_rec_id:
-        cursor.execute("SELECT * FROM source_records WHERE id = ?", (first_rec_id,))
-        first_rec = cursor.fetchone()
-    else:
-        conn.close()
-        return None
-
-    # Generate new UBID
-    result = generate_ubid(
-        first_rec["pincode"] if first_rec else "000000",
-        first_rec["pan"] if first_rec else None,
-        first_rec["gstin"] if first_rec else None,
-    )
-    if isinstance(result, tuple):
-        new_ubid, anchor_type, anchor_value = result
-    else:
-        new_ubid = result
-        anchor_type = anchor_value = None
-
-    # Create new UBID record
-    create_ubid_record(
-        new_ubid, anchor_type, anchor_value,
-        first_rec["normalized_name"] or first_rec["raw_name"],
-        first_rec["normalized_address"] or first_rec["raw_address"],
-        first_rec["pincode"]
-    )
-
-    # Move specified linkages
-    for rec_id in source_records_to_split:
-        cursor.execute("SELECT * FROM source_records WHERE id = ?", (rec_id,))
-        rec = cursor.fetchone()
-        if rec:
-            cursor.execute("""
-                UPDATE ubid_linkages SET ubid = ?, linked_by = ?
-                WHERE ubid = ? AND source_system = ? AND source_id = ? AND is_active = 1
-            """, (new_ubid, f"split:{split_by}", ubid, rec["source_system"], rec["source_id"]))
-
-    # Audit
-    cursor.execute("""
-        INSERT INTO audit_log (action_type, ubid, details, performed_by)
-        VALUES (?, ?, ?, ?)
-    """, ("ubid_split", ubid, json.dumps({
-        "new_ubid": new_ubid,
-        "records_moved": source_records_to_split,
-        "reason": reason,
-    }), split_by))
-
-    conn.commit()
-    conn.close()
-    return new_ubid
-
+    session = get_session()
+    try:
+        first_rec_id = source_records_to_split[0] if source_records_to_split else None
+        if not first_rec_id:
+            return None
+            
+        first_rec = session.query(SourceRecord).get(first_rec_id)
+        if not first_rec:
+            return None
+            
+        result = generate_ubid(
+            first_rec.pincode,
+            first_rec.pan,
+            first_rec.gstin,
+            session=session,
+        )
+        if isinstance(result, tuple):
+            new_ubid, anchor_type, anchor_value = result
+        else:
+            new_ubid = result
+            anchor_type = anchor_value = None
+            
+        create_ubid_record(
+            new_ubid, anchor_type, anchor_value,
+            first_rec.normalized_name or first_rec.raw_name,
+            first_rec.normalized_address or first_rec.raw_address,
+            first_rec.pincode,
+            session=session,
+        )
+        
+        for rec_id in source_records_to_split:
+            rec = session.query(SourceRecord).get(rec_id)
+            if rec:
+                link = session.query(UbidLinkage).filter_by(
+                    ubid=ubid, 
+                    source_system=rec.source_system, 
+                    source_id=rec.source_id,
+                    is_active=True
+                ).first()
+                if link:
+                    link.ubid = new_ubid
+                    link.linked_by = f"split:{split_by}"
+                    
+        audit = AuditLog(
+            action_type="ubid_split",
+            ubid=ubid,
+            performed_by=split_by,
+            details=json.dumps({
+                "new_ubid": new_ubid,
+                "records_moved": source_records_to_split,
+                "reason": reason,
+            })
+        )
+        session.add(audit)
+        session.commit()
+        return new_ubid
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        session.close()
 
 def choose_canonical(records):
-    """
-    Choose the best canonical name and address from a cluster of records.
-    Prefers: longest name (usually most complete), most complete address.
-    """
     if not records:
         return "", ""
 
-    # Score each record
     best_name = ""
     best_addr = ""
     best_name_score = -1
     best_addr_score = -1
 
     for rec in records:
-        name = rec.get("raw_name") or rec.get("normalized_name") or ""
-        addr = rec.get("raw_address") or rec.get("normalized_address") or ""
+        if isinstance(rec, dict):
+            name = rec.get("raw_name") or rec.get("normalized_name") or ""
+            addr = rec.get("raw_address") or rec.get("normalized_address") or ""
+        else:
+            name = rec.raw_name or rec.normalized_name or ""
+            addr = rec.raw_address or rec.normalized_address or ""
 
-        # Prefer formal names (those with legal suffixes)
         name_score = len(name)
         if any(s in name.lower() for s in ["pvt", "ltd", "private", "limited"]):
             name_score += 50

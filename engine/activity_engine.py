@@ -1,31 +1,20 @@
 """
 Activity Inference Engine for UBID Platform.
-
-Classifies each UBID as Active, Dormant, or Closed based on
-transaction and activity events from department systems.
-
-Rules:
-- Active:  ≥ 1 activity event in last 6 months
-- Dormant: Last activity between 6–18 months ago
-- Closed:  No activity for 18+ months, OR explicit closure event
-
-Every classification is explainable — stores which signals
-drove the verdict and over what time window.
 """
 
 import json
 from datetime import datetime, timedelta
 from collections import defaultdict
-from database.schema import get_connection
+from database.schema import get_session
+from database.models import SourceRecord, UbidMaster, UbidLinkage, ActivityEvent
+from activity_config import ActivityConfigManager
 from engine.normalizer import normalize_pan, normalize_gstin
 
 
-# ── Configuration ──
-REFERENCE_DATE = datetime(2025, 4, 1)  # "now" for synthetic data
-ACTIVE_WINDOW_DAYS = 180       # 6 months
-DORMANT_WINDOW_DAYS = 540      # 18 months
+REFERENCE_DATE = datetime(2025, 4, 1)  
+ACTIVE_WINDOW_DAYS = 180       
+DORMANT_WINDOW_DAYS = 540      
 
-# ── Event signal strengths ──
 EVENT_SIGNAL_STRENGTH = {
     "inspection_conducted": "strong",
     "license_renewed": "strong",
@@ -36,278 +25,249 @@ EVENT_SIGNAL_STRENGTH = {
     "employee_report_filed": "moderate",
     "pollution_test_passed": "moderate",
     "pollution_test_failed": "weak",
-    "compliance_notice_issued": "weak",
+    "compliance_notice_issued": "compliance_flag",
     "closure_application": "definitive_close",
 }
 
-
 def match_events_to_ubids():
-    """
-    Match activity events to UBIDs using available identifiers.
-    Events can be matched via:
-    1. PAN (extracted from raw_identifier)
-    2. GSTIN (extracted from raw_identifier)
-    3. Source system + source ID pattern
-    4. Business name fuzzy match (last resort)
+    session = get_session()
+    try:
+        events = session.query(ActivityEvent).filter(ActivityEvent.matched_ubid == None).all()
+        linkages = session.query(UbidLinkage, SourceRecord).join(
+            SourceRecord, 
+            (UbidLinkage.source_system == SourceRecord.source_system) & 
+            (UbidLinkage.source_id == SourceRecord.source_id)
+        ).filter(UbidLinkage.is_active == True).all()
 
-    Unmatched events are flagged for review.
-    """
-    conn = get_connection()
-    cursor = conn.cursor()
+        pan_to_ubid = {}
+        name_to_ubid = {}
 
-    # Load all events
-    cursor.execute("SELECT * FROM activity_events WHERE matched_ubid IS NULL")
-    events = [dict(row) for row in cursor.fetchall()]
+        for link, rec in linkages:
+            ubid = link.ubid
+            if rec.pan:
+                pan_to_ubid[rec.pan.upper()] = ubid
+            if rec.gstin:
+                gstin_norm, pan_from_gstin = normalize_gstin(rec.gstin)
+                if gstin_norm:
+                    pan_to_ubid[gstin_norm] = ubid
+                if pan_from_gstin:
+                    pan_to_ubid[pan_from_gstin] = ubid
+            
+            key1 = f"{rec.source_system}:{rec.raw_name}"
+            name_to_ubid[key1] = ubid
+            if rec.normalized_name:
+                key2 = f"{rec.source_system}:{rec.normalized_name}"
+                name_to_ubid[key2] = ubid
 
-    # Build lookup indexes from UBID linkages
-    # PAN → UBID
-    pan_to_ubid = {}
-    cursor.execute("""
-        SELECT um.ubid, sr.pan, sr.gstin
-        FROM ubid_master um
-        JOIN ubid_linkages ul ON um.ubid = ul.ubid
-        JOIN source_records sr ON ul.source_system = sr.source_system AND ul.source_id = sr.source_id
-        WHERE ul.is_active = 1
-    """)
-    for row in cursor.fetchall():
-        if row["pan"]:
-            pan_to_ubid[row["pan"].upper()] = row["ubid"]
-        if row["gstin"]:
-            gstin_norm, pan_from_gstin = normalize_gstin(row["gstin"])
-            if gstin_norm:
-                pan_to_ubid[gstin_norm] = row["ubid"]
-            if pan_from_gstin:
-                pan_to_ubid[pan_from_gstin] = row["ubid"]
+        matched_count = 0
+        unmatched_count = 0
 
-    # Source system:name → UBID (for name-based matching)
-    name_to_ubid = {}
-    cursor.execute("""
-        SELECT um.ubid, sr.source_system, sr.raw_name, sr.normalized_name
-        FROM ubid_master um
-        JOIN ubid_linkages ul ON um.ubid = ul.ubid
-        JOIN source_records sr ON ul.source_system = sr.source_system AND ul.source_id = sr.source_id
-        WHERE ul.is_active = 1
-    """)
-    for row in cursor.fetchall():
-        key = f"{row['source_system']}:{row['raw_name']}"
-        name_to_ubid[key] = row["ubid"]
-        if row["normalized_name"]:
-            key2 = f"{row['source_system']}:{row['normalized_name']}"
-            name_to_ubid[key2] = row["ubid"]
+        for event in events:
+            raw_id = (event.raw_identifier or "").strip()
+            matched_ubid = None
+            match_conf = 0.0
 
-    matched_count = 0
-    unmatched_count = 0
-
-    for event in events:
-        raw_id = (event.get("raw_identifier") or "").strip()
-        matched_ubid = None
-        match_conf = 0.0
-
-        # Try PAN match
-        pan = normalize_pan(raw_id)
-        if pan and pan in pan_to_ubid:
-            matched_ubid = pan_to_ubid[pan]
-            match_conf = 0.95
-
-        # Try GSTIN match
-        if not matched_ubid:
-            gstin_norm, pan_from_gstin = normalize_gstin(raw_id)
-            if gstin_norm and gstin_norm in pan_to_ubid:
-                matched_ubid = pan_to_ubid[gstin_norm]
+            pan = normalize_pan(raw_id)
+            if pan and pan in pan_to_ubid:
+                matched_ubid = pan_to_ubid[pan]
                 match_conf = 0.95
-            elif pan_from_gstin and pan_from_gstin in pan_to_ubid:
-                matched_ubid = pan_to_ubid[pan_from_gstin]
-                match_conf = 0.90
 
-        # Try source:name match
-        if not matched_ubid and raw_id in name_to_ubid:
-            matched_ubid = name_to_ubid[raw_id]
-            match_conf = 0.70
+            if not matched_ubid:
+                gstin_norm, pan_from_gstin = normalize_gstin(raw_id)
+                if gstin_norm and gstin_norm in pan_to_ubid:
+                    matched_ubid = pan_to_ubid[gstin_norm]
+                    match_conf = 0.95
+                elif pan_from_gstin and pan_from_gstin in pan_to_ubid:
+                    matched_ubid = pan_to_ubid[pan_from_gstin]
+                    match_conf = 0.90
 
-        # Try partial name match (system:name format)
-        if not matched_ubid and ":" in raw_id:
-            parts = raw_id.split(":", 1)
-            if len(parts) == 2:
-                key = f"{parts[0]}:{parts[1]}"
-                if key in name_to_ubid:
-                    matched_ubid = name_to_ubid[key]
-                    match_conf = 0.65
+            if not matched_ubid and raw_id in name_to_ubid:
+                matched_ubid = name_to_ubid[raw_id]
+                match_conf = 0.70
 
-        # Update event
-        if matched_ubid:
-            cursor.execute("""
-                UPDATE activity_events
-                SET matched_ubid = ?, match_confidence = ?
-                WHERE id = ?
-            """, (matched_ubid, match_conf, event["id"]))
-            matched_count += 1
-        else:
-            unmatched_count += 1
+            if not matched_ubid and ":" in raw_id:
+                parts = raw_id.split(":", 1)
+                if len(parts) == 2:
+                    key = f"{parts[0]}:{parts[1]}"
+                    if key in name_to_ubid:
+                        matched_ubid = name_to_ubid[key]
+                        match_conf = 0.65
 
-    conn.commit()
-    conn.close()
+            if matched_ubid:
+                event.matched_ubid = matched_ubid
+                event.match_confidence = match_conf
+                matched_count += 1
+            else:
+                unmatched_count += 1
+
+        session.commit()
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        session.close()
 
     print(f"[ACTIVITY] Matched {matched_count} events to UBIDs, {unmatched_count} unmatched")
     return matched_count, unmatched_count
 
-
 def classify_business_activity():
-    """
-    Classify each UBID as Active, Dormant, or Closed.
+    session = get_session()
+    try:
+        config_manager = ActivityConfigManager(session)
+        ubids = session.query(UbidMaster.ubid).filter(UbidMaster.activity_status != 'Merged').all()
+        ubids = [row[0] for row in ubids]
 
-    Returns summary of classifications.
-    """
-    conn = get_connection()
-    cursor = conn.cursor()
+        stats = {"Active": 0, "Dormant": 0, "Closed": 0, "Compliance Risk": 0, "Unknown": 0}
 
-    # Get all UBIDs
-    cursor.execute("SELECT ubid FROM ubid_master WHERE activity_status != 'Merged'")
-    ubids = [row["ubid"] for row in cursor.fetchall()]
+        for ubid in ubids:
+            events = session.query(ActivityEvent).filter_by(matched_ubid=ubid).order_by(ActivityEvent.event_date.desc()).all()
+            events_data = [{"event_type": e.event_type, "event_date": e.event_date} for e in events]
+            primary_system = _get_primary_system_for_ubid(session, ubid)
+            rule = config_manager.get_rule(primary_system, "all")
+            active_window_days = int((rule.active_window_months or 12) * 30)
+            dormant_window_days = int((rule.dormant_window_months or 24) * 30)
+            
+            status, evidence = _classify_single(
+                events_data,
+                active_window_days=active_window_days,
+                dormant_window_days=dormant_window_days,
+            )
+            evidence["rule_used"] = {
+                "department": rule.department,
+                "business_type": rule.business_type,
+                "active_window_months": rule.active_window_months,
+                "dormant_window_months": rule.dormant_window_months,
+            }
 
-    stats = {"Active": 0, "Dormant": 0, "Closed": 0, "Unknown": 0}
+            master = session.query(UbidMaster).get(ubid)
+            if master:
+                master.activity_status = status
+                master.status_updated_at = datetime.utcnow()
+                master.status_evidence = json.dumps(evidence)
 
-    for ubid in ubids:
-        # Get all events for this UBID
-        cursor.execute("""
-            SELECT * FROM activity_events
-            WHERE matched_ubid = ?
-            ORDER BY event_date DESC
-        """, (ubid,))
-        events = [dict(row) for row in cursor.fetchall()]
+            stats[status] += 1
 
-        status, evidence = _classify_single(events)
-
-        # Update UBID
-        cursor.execute("""
-            UPDATE ubid_master
-            SET activity_status = ?,
-                status_updated_at = datetime('now'),
-                status_evidence = ?
-            WHERE ubid = ?
-        """, (status, json.dumps(evidence), ubid))
-
-        stats[status] += 1
-
-    conn.commit()
-    conn.close()
+        session.commit()
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        session.close()
 
     print(f"[ACTIVITY] Classification complete: {stats}")
     return stats
 
 
-def _classify_single(events):
-    """
-    Classify a single business based on its events.
+def _get_primary_system_for_ubid(session, ubid):
+    systems = (
+        session.query(UbidLinkage.source_system)
+        .filter(UbidLinkage.ubid == ubid, UbidLinkage.is_active == True)
+        .all()
+    )
+    if not systems:
+        return "default"
 
-    Returns (status, evidence_dict)
-    """
+    counts = defaultdict(int)
+    for (source_system,) in systems:
+        counts[source_system] += 1
+
+    return max(counts.items(), key=lambda x: x[1])[0]
+
+def _is_seasonal(events):
+    if len(events) < 4:
+        return False
+    months = defaultdict(int)
+    years = set()
+    for evt in events:
+        try:
+            d = datetime.strptime(evt["event_date"], "%Y-%m-%d")
+            months[d.month] += 1
+            years.add(d.year)
+        except:
+            pass
+    if len(years) >= 2 and len(months) <= 3:
+        return True
+    return False
+
+def _has_compliance_risk(events):
+    if len(events) < 3:
+        return False
+    consecutive_notices = 0
+    for evt in events:
+        strength = EVENT_SIGNAL_STRENGTH.get(evt["event_type"])
+        if strength == "compliance_flag" or strength == "weak":
+            consecutive_notices += 1
+        else:
+            break
+            
+    return consecutive_notices >= 3
+
+def _classify_single(events, active_window_days=ACTIVE_WINDOW_DAYS, dormant_window_days=DORMANT_WINDOW_DAYS):
     if not events:
         return "Unknown", {
             "rule": "no_events",
             "explanation": "No activity events found for this business.",
             "event_count": 0,
-            "time_window": f"Analyzed till {REFERENCE_DATE.strftime('%Y-%m-%d')}",
         }
 
-    # Check for explicit closure
     for evt in events:
         if evt["event_type"] == "closure_application":
             return "Closed", {
                 "rule": "explicit_closure",
                 "explanation": f"Closure application filed on {evt['event_date']}.",
                 "decisive_event": evt["event_type"],
-                "decisive_date": evt["event_date"],
-                "event_count": len(events),
-                "time_window": f"{events[-1]['event_date']} to {events[0]['event_date']}",
-                "events_summary": _summarize_events(events),
             }
 
-    # Find most recent event
-    most_recent = events[0]  # already sorted DESC
+    if _has_compliance_risk(events):
+        return "Compliance Risk", {
+            "rule": "consecutive_compliance_failures",
+            "explanation": "Multiple consecutive compliance notices or failed tests without any positive response."
+        }
+
+    most_recent = events[0]
     try:
         most_recent_date = datetime.strptime(most_recent["event_date"], "%Y-%m-%d")
     except (ValueError, TypeError):
-        return "Unknown", {
-            "rule": "parse_error",
-            "explanation": "Could not parse event dates.",
-        }
+        return "Unknown", {"rule": "parse_error"}
 
     days_since_last = (REFERENCE_DATE - most_recent_date).days
 
-    if days_since_last <= ACTIVE_WINDOW_DAYS:
+    if days_since_last <= active_window_days:
         status = "Active"
         rule = "recent_activity"
-        explanation = (
-            f"Last activity ({most_recent['event_type']}) was {days_since_last} days ago "
-            f"on {most_recent['event_date']}, within the {ACTIVE_WINDOW_DAYS}-day active window."
-        )
-    elif days_since_last <= DORMANT_WINDOW_DAYS:
-        status = "Dormant"
-        rule = "stale_activity"
-        explanation = (
-            f"Last activity ({most_recent['event_type']}) was {days_since_last} days ago "
-            f"on {most_recent['event_date']}, between {ACTIVE_WINDOW_DAYS} and "
-            f"{DORMANT_WINDOW_DAYS} days — classified as Dormant."
-        )
+        explanation = f"Activity within {active_window_days} days."
+    elif days_since_last <= dormant_window_days:
+        is_seasonal = _is_seasonal(events)
+        if is_seasonal:
+            status = "Active"
+            rule = "seasonal_pattern_detected"
+            explanation = "Exceeded dormant threshold but historical seasonal clustering was detected."
+        else:
+            status = "Dormant"
+            rule = "stale_activity"
+            explanation = f"No activity for {days_since_last} days (between {active_window_days}-{dormant_window_days})."
     else:
         status = "Closed"
         rule = "no_recent_activity"
-        explanation = (
-            f"No activity for {days_since_last} days "
-            f"(last event on {most_recent['event_date']}). "
-            f"Exceeds {DORMANT_WINDOW_DAYS}-day threshold — classified as Closed."
-        )
+        explanation = f"No activity for {days_since_last} days. Classified as Closed."
 
     evidence = {
         "rule": rule,
         "explanation": explanation,
         "days_since_last_activity": days_since_last,
         "most_recent_event": most_recent["event_type"],
-        "most_recent_date": most_recent["event_date"],
-        "event_count": len(events),
-        "time_window": f"{events[-1]['event_date']} to {events[0]['event_date']}",
-        "signal_strengths": _count_signal_strengths(events),
-        "events_summary": _summarize_events(events),
     }
-
     return status, evidence
 
-
-def _count_signal_strengths(events):
-    """Count events by signal strength."""
-    counts = {"strong": 0, "moderate": 0, "weak": 0}
-    for evt in events:
-        strength = EVENT_SIGNAL_STRENGTH.get(evt["event_type"], "weak")
-        if strength in counts:
-            counts[strength] += 1
-    return counts
-
-
-def _summarize_events(events):
-    """Create a summary of event types and counts."""
-    type_counts = defaultdict(int)
-    for evt in events:
-        type_counts[evt["event_type"]] += 1
-    return dict(type_counts)
-
-
 def run_activity_inference():
-    """
-    Full activity inference pipeline:
-    1. Match events to UBIDs
-    2. Classify each UBID's activity status
-    """
     print("\n[ACTIVITY] Starting activity inference pipeline...")
-
     matched, unmatched = match_events_to_ubids()
     stats = classify_business_activity()
-
     return {
         "events_matched": matched,
         "events_unmatched": unmatched,
         "classifications": stats,
     }
-
 
 if __name__ == "__main__":
     run_activity_inference()

@@ -22,7 +22,8 @@ from datetime import datetime, timedelta
 
 # Add parent directory to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from database.schema import get_connection, init_db
+from database.schema import init_db, get_session
+from database.models import SourceRecord, ActivityEvent, UbidMaster, UbidLinkage, MatchCandidate, AuditLog, ReviewerFeedback
 
 # ── Seed for reproducibility ──
 random.seed(42)
@@ -115,7 +116,19 @@ def generate_pan():
     chars = ''.join(random.choices(string.ascii_uppercase, k=5))
     nums = ''.join(random.choices(string.digits, k=4))
     check = random.choice(string.ascii_uppercase)
-    return f"{chars}{nums}{check}"
+    pan = f"{chars}{nums}{check}"
+    return pan
+
+def apply_pan_noise(pan):
+    """Apply 5-8% chance of a single character transposition."""
+    if not pan:
+        return None
+    if random.random() < 0.08 and len(pan) > 2:
+        idx = random.randint(0, len(pan)-2)
+        pan_list = list(pan)
+        pan_list[idx], pan_list[idx+1] = pan_list[idx+1], pan_list[idx]
+        return "".join(pan_list)
+    return pan
 
 
 def generate_gstin(pan, state_code="29"):
@@ -189,6 +202,17 @@ def create_address_variant(base_address):
     for _ in range(random.randint(1, 3)):
         t = random.choice(transforms)
         result = t(result)
+        
+    # Address extreme chaos injection (10%)
+    if random.random() < 0.10:
+        result = result.replace(",", "").replace("-", " ") 
+        tokens = result.split()
+        if len(tokens) > 2:
+            # shuffle the first few tokens
+            sub = tokens[:3]
+            random.shuffle(sub)
+            result = " ".join(sub + tokens[3:])
+            
     return result.strip()
 
 
@@ -261,8 +285,9 @@ class BusinessEntity:
 
 def generate_shop_establishment_record(biz, seq):
     """Generate a Shop Establishment record."""
-    # Sometimes PAN/GSTIN missing in this system
-    pan = biz.pan if random.random() > 0.3 else None
+    # 15-20% omission in Shop Establishment PAN fields
+    pan = biz.pan if random.random() > 0.20 else None
+    pan = apply_pan_noise(pan)
     gstin = biz.gstin if random.random() > 0.5 else None
 
     return {
@@ -282,6 +307,7 @@ def generate_shop_establishment_record(biz, seq):
 def generate_factories_record(biz, seq):
     """Generate a Factories department record — tends to be more formal."""
     pan = biz.pan if random.random() > 0.15 else None
+    pan = apply_pan_noise(pan)
     gstin = biz.gstin if random.random() > 0.25 else None
 
     name = create_name_variant(biz.full_name, "minor")
@@ -306,6 +332,7 @@ def generate_factories_record(biz, seq):
 def generate_labour_record(biz, seq):
     """Generate a Labour department record — often abbreviated names, no GSTIN."""
     pan = biz.pan if random.random() > 0.4 else None
+    pan = apply_pan_noise(pan)
 
     return {
         "source_system": "labour",
@@ -414,15 +441,23 @@ def generate_all_data():
     """Main generation function."""
     print("[GEN] Starting synthetic data generation...")
 
-    # Initialize DB
+    # Initialize DB (using SQLAlchemy now)
     init_db()
-    conn = get_connection()
-    cursor = conn.cursor()
+    session = get_session()
 
-    # Clear existing data
-    for table in ["source_records", "activity_events", "ubid_master",
-                  "ubid_linkages", "match_candidates", "audit_log", "reviewer_feedback"]:
-        cursor.execute(f"DELETE FROM {table}")
+    try:
+        # Clear existing data via ORM
+        session.query(ReviewerFeedback).delete()
+        session.query(AuditLog).delete()
+        session.query(MatchCandidate).delete()
+        session.query(UbidLinkage).delete()
+        session.query(UbidMaster).delete()
+        session.query(ActivityEvent).delete()
+        session.query(SourceRecord).delete()
+        session.commit()
+    except Exception as e:
+        session.rollback()
+        print(f"[GEN] Warning during clear: {e}")
 
     businesses = []
     source_records = []
@@ -496,44 +531,49 @@ def generate_all_data():
             "_biz_idx": -1,
         })
 
-    # Insert source records
+    # Insert source records via ORM
     random.shuffle(source_records)
     for rec in source_records:
-        biz_idx = rec.pop("_biz_idx", None)
-        cursor.execute("""
-            INSERT INTO source_records
-            (source_system, source_id, raw_name, raw_address, pincode, pan, gstin,
-             owner_name, registration_date, category, raw_json)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            rec["source_system"], rec["source_id"], rec["raw_name"],
-            rec["raw_address"], rec["pincode"], rec.get("pan"),
-            rec.get("gstin"), rec.get("owner_name"),
-            rec.get("registration_date"), rec.get("category"),
-            json.dumps(rec)
-        ))
+        rec.pop("_biz_idx", None)
+        record = SourceRecord(
+            source_system=rec["source_system"],
+            source_id=rec["source_id"],
+            raw_name=rec["raw_name"],
+            raw_address=rec["raw_address"],
+            pincode=rec["pincode"],
+            pan=rec.get("pan"),
+            gstin=rec.get("gstin"),
+            owner_name=rec.get("owner_name"),
+            registration_date=rec.get("registration_date"),
+            category=rec.get("category"),
+            raw_json=json.dumps(rec)
+        )
+        session.add(record)
 
-    # Insert events
+    # Insert events via ORM
     for evt in all_events:
         evt.pop("_biz_idx", None)
-        cursor.execute("""
-            INSERT INTO activity_events
-            (source_system, event_type, event_date, event_details, raw_identifier)
-            VALUES (?, ?, ?, ?, ?)
-        """, (
-            evt["source_system"], evt["event_type"], evt["event_date"],
-            evt["event_details"], evt["raw_identifier"]
-        ))
+        event = ActivityEvent(
+            source_system=evt["source_system"],
+            event_type=evt["event_type"],
+            event_date=evt["event_date"],
+            event_details=evt["event_details"],
+            raw_identifier=evt["raw_identifier"]
+        )
+        session.add(event)
 
-    conn.commit()
+    try:
+        session.commit()
+    except Exception as e:
+        session.rollback()
+        raise e
 
     # Print summary
-    cursor.execute("SELECT COUNT(*) FROM source_records")
-    num_records = cursor.fetchone()[0]
-    cursor.execute("SELECT source_system, COUNT(*) FROM source_records GROUP BY source_system")
-    by_system = {row[0]: row[1] for row in cursor.fetchall()}
-    cursor.execute("SELECT COUNT(*) FROM activity_events")
-    num_events = cursor.fetchone()[0]
+    num_records = session.query(SourceRecord).count()
+    from sqlalchemy import func
+    by_system_query = session.query(SourceRecord.source_system, func.count(SourceRecord.id)).group_by(SourceRecord.source_system).all()
+    by_system = {sys: count for sys, count in by_system_query}
+    num_events = session.query(ActivityEvent).count()
 
     print(f"\n[GEN] === Synthetic Data Summary ===")
     print(f"[GEN] Real businesses: {NUM_REAL_BUSINESSES}")
@@ -546,7 +586,7 @@ def generate_all_data():
     print(f"[GEN] Unmatched events: 20")
     print(f"[GEN] ================================\n")
 
-    conn.close()
+    session.close()
     return num_records, num_events
 
 

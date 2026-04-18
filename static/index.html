@@ -38,24 +38,28 @@
             <span class="nav-section-title">Platform</span>
             <button class="nav-item active" data-view="dashboard" id="nav-dashboard">
                 <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg>
-                <span>Dashboard</span>
+                <span data-i18n="dashboard">Dashboard</span>
             </button>
             <button class="nav-item" data-view="search" id="nav-search">
                 <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="11" cy="11" r="7"/><path d="M16 16l4.5 4.5"/></svg>
-                <span>Search & Lookup</span>
+                <span data-i18n="search">Search & Lookup</span>
             </button>
             <button class="nav-item" data-view="review" id="nav-review">
                 <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M9 11l3 3 8-8"/><path d="M21 12v7a2 2 0 01-2 2H5a2 2 0 01-2-2V5a2 2 0 012-2h11"/></svg>
-                <span>Review Queue</span>
+                <span data-i18n="review_queue">Review Queue</span>
                 <span class="nav-badge" id="review-badge" style="display:none">0</span>
             </button>
             <button class="nav-item" data-view="activity" id="nav-activity">
                 <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><polyline points="22,12 18,12 15,21 9,3 6,12 2,12"/></svg>
-                <span>Activity & Timeline</span>
+                <span data-i18n="activity">Activity & Timeline</span>
             </button>
             <button class="nav-item" data-view="analytics" id="nav-analytics">
                 <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M18 20V10"/><path d="M12 20V4"/><path d="M6 20v-6"/></svg>
-                <span>Analytics</span>
+                <span data-i18n="analytics">Analytics</span>
+            </button>
+            <button class="nav-item" data-view="operations" id="nav-operations">
+                <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M4 7h16"/><path d="M4 12h16"/><path d="M4 17h10"/></svg>
+                <span data-i18n="operations">Operations</span>
             </button>
         </div>
 
@@ -68,6 +72,13 @@
         </div>
 
         <div class="sidebar-footer">
+            <div class="mb-2">
+                <label for="language-select" class="text-sm text-muted">Language</label>
+                <select id="language-select" class="param-input" style="width:100%;margin-top:0.4rem">
+                    <option value="en">English</option>
+                    <option value="kn">Kannada</option>
+                </select>
+            </div>
             <div class="system-status">
                 <div class="status-dot"></div>
                 <span>System Ready</span>
@@ -274,6 +285,92 @@
                             <button class="btn btn-primary" onclick="runCustomQuery()">Run Query</button>
                         </div>
                         <div id="custom-query-results"></div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- ── Operations View ── -->
+        <section id="view-operations" class="view">
+            <div class="view-header">
+                <div>
+                    <h1>Operations Hub</h1>
+                    <p class="view-subtitle">Universal search, evidence, cockpit, watchlists, golden records, DQ, geo, and policy simulation</p>
+                </div>
+            </div>
+
+            <div class="analytics-section">
+                <div class="card">
+                    <div class="card-header"><h3>Universal Search</h3></div>
+                    <div class="card-body">
+                        <div class="query-params">
+                            <input type="text" id="ops-universal-query" class="param-input" placeholder="PAN, GSTIN, mobile, owner, pincode, name, address...">
+                            <button class="btn btn-primary" onclick="runUniversalSearchOps()">Search</button>
+                        </div>
+                        <div id="ops-universal-results"></div>
+                    </div>
+                </div>
+
+                <div class="card">
+                    <div class="card-header"><h3>UBID Evidence & Golden Record</h3></div>
+                    <div class="card-body">
+                        <div class="query-params">
+                            <input type="text" id="ops-ubid" class="param-input" placeholder="UBID-KA-...">
+                            <button class="btn btn-outline" onclick="loadEvidenceOps()">Evidence</button>
+                            <button class="btn btn-primary" onclick="recomputeGoldenOps()">Recompute Golden</button>
+                        </div>
+                        <div id="ops-evidence-results"></div>
+                    </div>
+                </div>
+
+                <div class="card">
+                    <div class="card-header"><h3>Reviewer Cockpit</h3></div>
+                    <div class="card-body">
+                        <div class="query-params">
+                            <button class="btn btn-outline" onclick="loadCockpitOps()">Load Priority Queue</button>
+                        </div>
+                        <div id="ops-cockpit-results"></div>
+                    </div>
+                </div>
+
+                <div class="card">
+                    <div class="card-header"><h3>Intelligence & Governance</h3></div>
+                    <div class="card-body">
+                        <div class="query-params">
+                            <button class="btn btn-outline" onclick="runNetworkGraphOps()">Network Graph Risk</button>
+                            <button class="btn btn-outline" onclick="runLearningPreviewOps()">Learning Preview</button>
+                            <button class="btn btn-primary" onclick="runLearningApplyOps()">Apply Learning</button>
+                            <button class="btn btn-outline" onclick="runDeptScorecardsOps()">Department Scorecards</button>
+                            <button class="btn btn-primary" onclick="runExecutiveDashboardOps()">Executive Dashboard</button>
+                        </div>
+                        <div id="ops-intelligence-results"></div>
+                    </div>
+                </div>
+
+                <div class="card">
+                    <div class="card-header"><h3>Trust Score & Action Workflows</h3></div>
+                    <div class="card-body">
+                        <div class="query-params">
+                            <input type="text" id="ops-trust-ubid" class="param-input" placeholder="UBID-KA-...">
+                            <button class="btn btn-primary" onclick="loadTrustScoreOps()">Trust Score</button>
+                            <button class="btn btn-outline" onclick="loadInspectionPriorityOps()">Inspection Priority</button>
+                            <button class="btn btn-outline" onclick="loadRenewalRiskOps()">Renewal Risk</button>
+                            <button class="btn btn-primary" onclick="loadShellBundlesOps()">Shell Review Bundles</button>
+                        </div>
+                        <div id="ops-workflow-results"></div>
+                    </div>
+                </div>
+
+                <div class="card">
+                    <div class="card-header"><h3>Risk, Data Quality, Geo, Policy</h3></div>
+                    <div class="card-body">
+                        <div class="query-params">
+                            <button class="btn btn-outline" onclick="loadAlertsOps()">Watchlist Alerts</button>
+                            <button class="btn btn-outline" onclick="loadDQOps()">Data Quality</button>
+                            <button class="btn btn-outline" onclick="loadGeoOps()">Geo Analytics</button>
+                            <button class="btn btn-primary" onclick="simulatePolicyOps()">Simulate Policy</button>
+                        </div>
+                        <div id="ops-risk-results"></div>
                     </div>
                 </div>
             </div>

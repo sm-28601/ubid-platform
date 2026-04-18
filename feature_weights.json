@@ -1,0 +1,8 @@
+{
+  "pan_match": 0.35,
+  "gstin_match": 0.3,
+  "name_similarity": 0.15,
+  "address_similarity": 0.1,
+  "pincode_match": 0.05,
+  "owner_similarity": 0.05
+}
